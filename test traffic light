@@ -1,0 +1,171 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+
+// Cài đặt WiFi và MQTT
+const char* ssid = "LCH";
+const char* password = "11223344";
+const char* mqtt_server = "demo.thingsboard.io";
+const int mqtt_port = 1883;
+const char* accessToken = "VbAuoKsMiCdK2aDU6GD4";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// Chân LED cho đèn giao thông
+const int redPin = 26;
+const int yellowPin = 25;
+const int greenPin = 33;
+
+// Thời gian trễ (ms)
+int redDelay = 5000;
+int greenDelay = 5000;
+int yellowDelay = 3000;
+bool autoMode = true; // true = Tự động, false = Thủ công
+String currentColor = ""; // Theo dõi màu hiện tại
+unsigned long lastChangeTime = 0; // Thời gian thay đổi màu cuối cùng
+String autoState = "RED"; // Trạng thái hiện tại trong chế độ tự động
+
+void setup_wifi() {
+  delay(10);
+  Serial.println();
+  Serial.print("Kết nối với ");
+  Serial.println(ssid);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.println("Đã kết nối WiFi");
+}
+
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Kết nối với ThingsBoard...");
+    if (client.connect("ESP32TrafficLight", accessToken, NULL)) {
+      Serial.println("đã kết nối");
+      client.subscribe("v1/devices/me/rpc/request/+"); // Đăng ký nhận lệnh RPC
+    } else {
+      Serial.print("thất bại, rc=");
+      Serial.print(client.state());
+      Serial.println(" thử lại sau 5 giây");
+      delay(5000);
+    }
+  }
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  for (unsigned int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+  Serial.print("Nhận được RPC: ");
+  Serial.println(msg);
+
+  StaticJsonDocument<200> doc;
+  DeserializationError error = deserializeJson(doc, msg);
+
+  if (error) {
+    Serial.print("deserializeJson() thất bại: ");
+    Serial.println(error.c_str());
+    return;
+  }
+
+  // Xử lý phương thức RPC
+  const char* method = doc["method"];
+  if (method && String(method) == "setLight") {
+    autoMode = false; // Chuyển sang chế độ thủ công
+    String color = doc["params"].as<String>();
+    if (color == "RED" || color == "GREEN" || color == "YELLOW") {
+      setLight(color);
+      currentColor = color; // Lưu màu hiện tại
+      lastChangeTime = millis(); // Cập nhật thời gian thay đổi
+    }
+  } else if (method && String(method) == "resumeAuto") {
+    autoMode = true;
+    currentColor = "";
+    autoState = "RED"; // Bắt đầu lại từ ĐỎ
+    lastChangeTime = millis(); // Đặt lại thời gian
+    setLight(autoState); // Bật đèn đầu tiên trong chế độ tự động
+    Serial.println("Chuyển sang chế độ TỰ ĐỘNG");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(redPin, OUTPUT);
+  pinMode(yellowPin, OUTPUT);
+  pinMode(greenPin, OUTPUT);
+
+  setup_wifi();
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
+
+  // Khởi động với đèn ĐỎ
+  setLight("RED");
+  autoState = "RED";
+  lastChangeTime = millis();
+}
+
+void loop() {
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+
+  // Xử lý chế độ tự động mà không dùng delay
+  if (autoMode) {
+    unsigned long currentTime = millis();
+    if (autoState == "RED" && currentTime - lastChangeTime >= redDelay) {
+      autoState = "GREEN";
+      setLight(autoState);
+      lastChangeTime = currentTime;
+    } else if (autoState == "GREEN" && currentTime - lastChangeTime >= greenDelay) {
+      autoState = "YELLOW";
+      setLight(autoState);
+      lastChangeTime = currentTime;
+    } else if (autoState == "YELLOW" && currentTime - lastChangeTime >= yellowDelay) {
+      autoState = "RED";
+      setLight(autoState);
+      lastChangeTime = currentTime;
+    }
+  }
+  // Chế độ thủ công: không làm gì, giữ trạng thái đèn hiện tại
+}
+
+void setLight(String color) {
+  if (color == "RED") {
+    digitalWrite(redPin, HIGH);
+    digitalWrite(yellowPin, LOW);
+    digitalWrite(greenPin, LOW);
+  } else if (color == "GREEN") {
+    digitalWrite(redPin, LOW);
+    digitalWrite(yellowPin, LOW);
+    digitalWrite(greenPin, HIGH);
+  } else if (color == "YELLOW") {
+    digitalWrite(redPin, LOW);
+    digitalWrite(yellowPin, HIGH);
+    digitalWrite(greenPin, LOW);
+  }
+
+  sendStatus(color);
+}
+
+void sendStatus(String color) {
+  String payload = "{";
+  if (color == "RED") payload += "\"traffic_light\":\"RED 🔴\"";
+  else if (color == "GREEN") payload += "\"traffic_light\":\"GREEN 🟢\"";
+  else if (color == "YELLOW") payload += "\"traffic_light\":\"YELLOW 🟡\"";
+  payload += "}";
+
+  Serial.print("Gửi payload: ");
+  Serial.println(payload);
+
+  if (client.publish("v1/devices/me/telemetry", (char*)payload.c_str())) {
+    Serial.println("Gửi thành công");
+  } else {
+    Serial.println("Gửi thất bại");
+  }
+}
