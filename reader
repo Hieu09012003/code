@@ -1,0 +1,248 @@
+import cv2
+import numpy as np
+from LCDetect import load_model, detect_lp, im2single
+from Contour import Contour
+import time
+import os
+import pandas as pd
+
+class LPResult:
+    def __init__(self, image: np.ndarray, plate: str, type: int):
+        self.__image = image
+        self.__plate = plate
+        self.__type = type
+
+    def image(self):
+        return self.__image
+
+    def plate(self):
+        return self.__plate
+
+    def type(self):
+        return self.__type
+
+    def type_str(self):
+        if self.__type is None:
+            return "Unknown"
+        return "Rectangle" if self.__type == Reader.RECTANGLE else "Square"
+
+    def __str__(self):
+        return f"Plate: {self.__plate}, Type: {self.type_str()}"
+
+    def __repr__(self):
+        return self.__str__()
+
+
+class Reader:
+    RECTANGLE = 1
+    SQUARE = 2
+
+    SQ_PART_THRESHOLD = 0.5
+    CHARSET = "0123456789ABCDEFGHKLMNPRSTUVXYZ"
+    DMAX, DMIN = 608, 288
+    LP_THRESHOLD = 0.5
+    DIGIT_W, DIGIT_H = 30, 60
+
+    CONTRAST_KERSIZE = 15
+    OPEN_KERSIZE = 6
+    BPC_THRESHOLD = 0.6
+    WPC_THRESHOLD = 0.7
+
+    MARGINS = {
+        "RECTANGLE": {"TOP": 0.01, "BOTTOM": 0.0, "LEFT": 0.01, "RIGHT": 0.0},
+        "SQUARE": {"TOP": 0.05, "BOTTOM": 0.05, "LEFT": 0.01, "RIGHT": 0.01}
+    }
+
+    RATIO_RANGE = (1.3, 4.5)
+    DIGIT_THRESHOLD = {
+        "RECTANGLE": {"MIN_HEIGHT": 0.3, "MAX_WIDTH": 0.5},
+        "SQUARE": {"MIN_HEIGHT": 0.3, "MAX_HEIGHT": 0.6, "MIN_WIDTH": 0.05, "MAX_WIDTH": 0.6}
+    }
+
+    WPOD_NET_MODEL = None
+    WPOD_NET_PATH = "wpod-net_update1.json"
+    SVM_MODEL_PATH = "training/svm.xml"
+    SVM_MODEL_PATH_DIGIT = "training/digit_only.xml"
+    SVM_MODEL = None
+    SVM_MODEL_DIGIT = None
+
+    def __init__(self):
+        if Reader.WPOD_NET_MODEL is None:
+            Reader.WPOD_NET_MODEL = load_model(Reader.WPOD_NET_PATH)
+
+    @staticmethod
+    def wpod():
+        if Reader.WPOD_NET_MODEL is None:
+            Reader.WPOD_NET_MODEL = load_model(Reader.WPOD_NET_PATH)
+        return Reader.WPOD_NET_MODEL
+
+    @staticmethod
+    def svm():
+        if Reader.SVM_MODEL is None:
+            Reader.SVM_MODEL = cv2.ml.SVM_load(Reader.SVM_MODEL_PATH)
+        return Reader.SVM_MODEL
+
+    @staticmethod
+    def svm_digit():
+        if Reader.SVM_MODEL_DIGIT is None:
+            Reader.SVM_MODEL_DIGIT = cv2.ml.SVM_load(Reader.SVM_MODEL_PATH_DIGIT)
+        return Reader.SVM_MODEL_DIGIT
+
+    @staticmethod
+    def count_black_pixels(image):
+        return int(np.sum(image == 0))
+
+    @staticmethod
+    def get_border(image):
+        top, bottom, left, right = 0, image.shape[0] - 1, 0, image.shape[1] - 1
+
+        while top < image.shape[0]:
+            if np.sum(image[top, :] == 255) / image.shape[1] < Reader.WPC_THRESHOLD:
+                break
+            top += 1
+        while bottom > int(image.shape[0] * 0.7):
+            if np.sum(image[bottom, :] == 255) / image.shape[1] < Reader.WPC_THRESHOLD:
+                break
+            bottom -= 1
+        while left < image.shape[1]:
+            if np.sum(image[:, left] == 255) / image.shape[0] < Reader.WPC_THRESHOLD:
+                break
+            left += 1
+        while right > int(image.shape[1] * 0.7):
+            if np.sum(image[:, right] == 255) / image.shape[0] < Reader.WPC_THRESHOLD:
+                break
+            right -= 1
+
+        return top, bottom, left, right
+
+    @staticmethod
+    def process(image):
+        # 1️⃣ Grayscale
+        if len(image.shape) == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+        # 2️⃣ CLAHE - Cân bằng tương phản cục bộ
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        image = clahe.apply(image)
+
+        # 3️⃣ Điều chỉnh kernel tương phản dựa vào độ sáng trung bình
+        mean_intensity = np.mean(image)
+        if mean_intensity > 180:
+            ksize = 9
+        elif mean_intensity > 130:
+            ksize = 11
+        else:
+            ksize = 15
+        kernel_contrast = cv2.getStructuringElement(cv2.MORPH_RECT, (ksize, ksize))
+
+        # 4️⃣ Tăng tương phản bằng Top-hat & Black-hat
+        tophat = cv2.morphologyEx(image, cv2.MORPH_TOPHAT, kernel_contrast)
+        blackhat = cv2.morphologyEx(image, cv2.MORPH_BLACKHAT, kernel_contrast)
+        image = cv2.add(image, tophat)
+        image = cv2.subtract(image, blackhat)
+
+        # 5️⃣ Làm mịn & nhị phân hóa
+        image = cv2.GaussianBlur(image, (5, 5), 0)
+        _, image = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+        # 6️⃣ Morphology Open để nối nét
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (Reader.OPEN_KERSIZE, Reader.OPEN_KERSIZE))
+        image = cv2.morphologyEx(image, cv2.MORPH_OPEN, kernel_open)
+
+        # 7️⃣ Cắt viền thừa
+        t, b, l, r = Reader.get_border(image)
+        image = image[t:b, l:r]
+        return image, t, b, l, r
+
+    @staticmethod
+    def add_margins(image, type):
+        margin = Reader.MARGINS["RECTANGLE"] if type == Reader.RECTANGLE else Reader.MARGINS["SQUARE"]
+        h, w = image.shape[:2]
+        t = int(h * margin["TOP"])
+        b = int(h * margin["BOTTOM"])
+        l = int(w * margin["LEFT"])
+        r = int(w * margin["RIGHT"])
+        return image[t:h - b, l:w - r]
+
+    @staticmethod
+    def filter(rect, im_height, im_width, lp_type):
+        x, y, w, h = rect
+        ratio = h / float(w)
+        if not (Reader.RATIO_RANGE[0] <= ratio <= Reader.RATIO_RANGE[1]):
+            return False
+
+        if lp_type == Reader.RECTANGLE:
+            d = Reader.DIGIT_THRESHOLD["RECTANGLE"]
+            return h/im_height >= d["MIN_HEIGHT"] and w/im_width <= d["MAX_WIDTH"]
+        else:
+            d = Reader.DIGIT_THRESHOLD["SQUARE"]
+            return (d["MIN_HEIGHT"] <= h/im_height <= d["MAX_HEIGHT"] and
+                    d["MIN_WIDTH"] <= w/im_width <= d["MAX_WIDTH"])
+
+    @staticmethod
+    def remove_holes(contours, thresh_img):
+        rects = [cv2.boundingRect(c) for c in contours]
+        removed = []
+        for i, r1 in enumerate(rects):
+            for j, r2 in enumerate(rects):
+                if i != j and r1[0] < r2[0] < r1[0]+r1[2] and r1[1] < r2[1] < r1[1]+r1[3]:
+                    sub = thresh_img[r2[1]:r2[1]+r2[3], r2[0]:r2[0]+r2[2]]
+                    bpc = Reader.count_black_pixels(sub)
+                    if bpc > Reader.BPC_THRESHOLD * r2[2] * r2[3]:
+                        removed.append(j)
+        return [c for i, c in enumerate(contours) if i not in removed]
+
+    @staticmethod
+    def sort_contours(contours, image, type):
+        if type == Reader.RECTANGLE:
+            contours = sorted(contours, key=lambda c: cv2.boundingRect(c)[0])
+            return [Contour(c, False) for c in contours]
+
+        top, bot, h = [], [], image.shape[0]
+        for c in contours:
+            x, y, w, hh = cv2.boundingRect(c)
+            if y + hh / 2 < h * Reader.SQ_PART_THRESHOLD:
+                top.append((x, c))
+            else:
+                bot.append((x, c))
+        top = sorted(top, key=lambda p: p[0])
+        bot = sorted(bot, key=lambda p: p[0])
+        return [Contour(c, False) for _, c in top] + [Contour(c, True) for _, c in bot]
+
+    @staticmethod
+    def read(image, plot=False, fname=""):
+        ratio = float(max(image.shape[:2])) / min(image.shape[:2])
+        side = int(ratio * Reader.DMIN)
+        bound_dim = min(side, Reader.DMAX)
+        _, LpImg, lp_type = detect_lp(Reader.wpod(), im2single(image), bound_dim, lp_threshold=Reader.LP_THRESHOLD)
+        if not len(LpImg):
+            return LPResult(None, None, None)
+
+        LpImg[0] = cv2.convertScaleAbs(LpImg[0], alpha=(255.0))
+        LpImg[0] = Reader.add_margins(LpImg[0], lp_type)
+
+        proc, t, b, l, r = Reader.process(LpImg[0])
+        LpImg[0] = LpImg[0][t:b, l:r]
+        roi = LpImg[0]
+
+        cont, _ = cv2.findContours(proc, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        rects = [cv2.boundingRect(c) for c in cont]
+        valid = [cont[i] for i, r in enumerate(rects) if Reader.filter(r, roi.shape[0], roi.shape[1], lp_type)]
+        valid = Reader.remove_holes(valid, proc)
+        valid = Reader.sort_contours(valid, roi, lp_type)
+
+        model_svm = Reader.svm()
+        model_svm_digit = Reader.svm_digit()
+
+        lp_str = ""
+        for c in valid:
+            x, y, w, h = cv2.boundingRect(c.get_contour())
+            char = proc[y:y+h, x:x+w]
+            char = cv2.resize(char, (Reader.DIGIT_W, Reader.DIGIT_H))
+            _, char = cv2.threshold(char, 30, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            char = np.float32(char).reshape(-1, Reader.DIGIT_W * Reader.DIGIT_H)
+            svm = model_svm_digit if c.get_is_numeric() else model_svm
+            result = int(svm.predict(char)[1][0, 0])
+            lp_str += str(result) if result <= 9 else chr(result)
+
+        return LPResult(roi, lp_str, lp_type)
