@@ -1,0 +1,233 @@
+import os
+import json
+import time
+import cv2
+import numpy as np
+import paho.mqtt.client as mqtt
+from ultralytics import YOLO
+from sort.sort import Sort
+from Reader import Reader
+from util import write_csv
+
+# ====== CẤU HÌNH (chỉnh nếu cần) ======
+ACCESS_TOKEN = "1lZGDfQeEZJ7UqV30cTh"
+BROKER = "demo.thingsboard.io"
+PORT = 1883
+
+VIDEO_PATH = "./1021.mp4"
+OUTPUT_PATH = "./output_violation.mp4"
+OUTPUT_CSV = "./results_output.csv"
+
+# YOLO Models
+COCO_MODEL_WEIGHT = "yolov8n.pt"
+# NOTE: Reader (WPOD) sẽ load WPOD_NET từ Reader.WPOD_NET_PATH
+
+# Các lớp quan tâm (COCO IDs)
+# 2: car, 3: motorcycle, 5: bus, 7: truck (như file của bạn)
+VEHICLE_CLASSES = [2, 3, 5, 7]
+
+# Vùng vi phạm (theo khung video) - điều chỉnh phù hợp
+VIOLATION_ZONE = [100, 1150, 2250, 1820]  # [x1, y1, x2, y2]
+
+# Ngưỡng IoU để xem là vi phạm
+IOU_THRESHOLD_VIOLATION = 0.2
+
+# Khoảng mở rộng vùng crop xe khi gửi cho Reader (tăng tỉ lệ chứa biển)
+CROP_EXPAND = 0.1  # mở rộng 10% so với bbox theo mỗi chiều
+
+# =======================================
+
+# Global flag bật/tắt nhận diện khi có đèn đỏ
+detecting = False
+
+# MQTT callbacks
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        print("✅ Kết nối ThingsBoard thành công!")
+        client.subscribe("v1/devices/me/attributes")
+        client.subscribe("v1/devices/me/rpc/request/+")
+    else:
+        print("❌ Kết nối MQTT thất bại, rc=", rc)
+
+def on_message(client, userdata, msg):
+    global detecting
+    payload = msg.payload.decode('utf-8')
+    print(f"[MQTT] Nhận topic: {msg.topic} | Payload: {payload}")
+    try:
+        data = json.loads(payload)
+        if "method" in data and data["method"] == "camera_action":
+            color = data["params"].get("traffic_light", "")
+            if color == "🔴":
+                detecting = True
+                print("🚨 ĐÈN ĐỎ: BẮT ĐẦU PHÁT HIỆN VI PHẠM")
+            else:
+                detecting = False
+                print("🟢/🟡: DỪNG NHẬN DIỆN VI PHẠM")
+    except Exception as e:
+        # payload có thể là attribute update (không phải RPC), in ra cho debug
+        print("⚠️ Lỗi xử lý MQTT payload:", e)
+
+# Hàm tính IoU giữa 2 box [x1,y1,x2,y2]
+def calculate_iou(box, zone):
+    xA = max(box[0], zone[0])
+    yA = max(box[1], zone[1])
+    xB = min(box[2], zone[2])
+    yB = min(box[3], zone[3])
+    interW = max(0, xB - xA)
+    interH = max(0, yB - yA)
+    interArea = interW * interH
+    if interArea == 0:
+        return 0.0
+    boxArea = (box[2] - box[0]) * (box[3] - box[1])
+    zoneArea = (zone[2] - zone[0]) * (zone[3] - zone[1])
+    union = boxArea + zoneArea - interArea + 1e-9
+    return interArea / union
+
+def expand_bbox(box, expand_ratio, frame_w, frame_h):
+    x1, y1, x2, y2 = box
+    w = x2 - x1
+    h = y2 - y1
+    dx = w * expand_ratio
+    dy = h * expand_ratio
+    ex1 = int(max(0, x1 - dx))
+    ey1 = int(max(0, y1 - dy))
+    ex2 = int(min(frame_w - 1, x2 + dx))
+    ey2 = int(min(frame_h - 1, y2 + dy))
+    return [ex1, ey1, ex2, ey2]
+
+def process_video():
+    # Load models & utils
+    print("🔁 Khởi tạo model YOLO + Tracker + Reader (WPOD + SVM)...")
+    coco_model = YOLO(COCO_MODEL_WEIGHT)
+    mot_tracker = Sort()
+    reader = Reader()  # Reader tự load WPOD_NET khi khởi tạo
+
+    cap = cv2.VideoCapture(VIDEO_PATH)
+    if not cap.isOpened():
+        print("❌ Không thể mở video:", VIDEO_PATH)
+        return
+
+    fps = int(cap.get(cv2.CAP_PROP_FPS) or 25)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(OUTPUT_PATH, fourcc, fps, (width, height))
+    print(f"📹 Video: {width}x{height} @ {fps}fps")
+
+    frame_n = 0
+    results = {}  # dict[frame_n][car_id] = {...} để write_csv sử dụng
+    processed_violation_ids = set()  # tránh đọc biển số lặp cho cùng track_id
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame_n += 1
+        results[frame_n] = {}
+
+        # YOLO detect
+        dets = coco_model(frame, conf=0.3)[0]
+        detections_ = []
+        for box in dets.boxes.data.tolist():
+            x1, y1, x2, y2, score, class_id = box
+            if int(class_id) in VEHICLE_CLASSES:
+                detections_.append([x1, y1, x2, y2, score])
+
+        # Tracking update
+        if len(detections_) > 0:
+            track_ids = mot_tracker.update(np.asarray(detections_))
+        else:
+            track_ids = mot_tracker.update(np.empty((0, 5)))
+
+        # Vẽ vùng vi phạm
+        cv2.rectangle(frame, (VIOLATION_ZONE[0], VIOLATION_ZONE[1]), (VIOLATION_ZONE[2], VIOLATION_ZONE[3]), (0, 0, 255), 3)
+        cv2.putText(frame, "Violation Zone", (VIOLATION_ZONE[0], VIOLATION_ZONE[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+
+        # Xử lý từng track
+        for track in track_ids:
+            x1, y1, x2, y2, track_id = track
+            x1i, y1i, x2i, y2i = int(x1), int(y1), int(x2), int(y2)
+            car_box = [x1i, y1i, x2i, y2i]
+            iou = calculate_iou(car_box, VIOLATION_ZONE)
+
+            # Lưu thông tin cơ bản vào structure results (dự phòng)
+            if track_id not in results[frame_n]:
+                results[frame_n][int(track_id)] = {}
+            results[frame_n][int(track_id)]['car'] = {'bbox': [x1i, y1i, x2i, y2i]}
+
+            if detecting and iou > IOU_THRESHOLD_VIOLATION:
+                # Xe vi phạm (màu đỏ)
+                cv2.rectangle(frame, (x1i, y1i), (x2i, y2i), (0, 0, 255), 3)
+                cv2.putText(frame, f"VIOLATION #{int(track_id)}", (x1i, y1i - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
+
+                # Nếu chưa đọc biển số cho track này thì đọc
+                tid = int(track_id)
+                if tid not in processed_violation_ids:
+                    # Crop vùng xe (mở rộng một chút để đảm bảo chứa biển)
+                    ex1, ey1, ex2, ey2 = expand_bbox(car_box, CROP_EXPAND, width, height)
+                    crop = frame[ey1:ey2, ex1:ex2].copy()
+                    if crop.size == 0:
+                        print(f"⚠️ Crop rỗng cho track {tid} frame {frame_n}")
+                    else:
+                        try:
+                            # Reader.read trả về LPResult
+                            print(f"🔎 Đang đọc biển cho track {tid} tại frame {frame_n} ...")
+                            lp_res = reader.read(crop, plot=False, fname=f"{frame_n}_{tid}.png")
+                            plate_text = lp_res.plate()
+                            plate_type = lp_res.type_str()
+                            print(f"➡️ Kết quả đọc: {plate_text} | Loại: {plate_type}")
+                        except Exception as e:
+                            print("⚠️ Lỗi khi gọi Reader.read:", e)
+                            plate_text = None
+                            plate_type = None
+
+                        # Ghi vào kết quả để write_csv dùng
+                        results[frame_n][tid]['license_plate'] = {
+                            'bbox': [ex1, ey1, ex2, ey2, 1.0, 0],  # format giả định (x1 y1 x2 y2 score class_id)
+                            'bbox_score': 1.0,
+                            'text': plate_text if plate_text is not None else "",
+                            'text_score': 1.0 if plate_text else 0.0
+                        }
+
+                        processed_violation_ids.add(tid)
+
+            else:
+                # Xe bình thường (xanh/cyan)
+                cv2.rectangle(frame, (x1i, y1i), (x2i, y2i), (255, 255, 0), 2)
+
+        # Hiển thị & ghi frame
+        cv2.imshow("Traffic Monitoring + OCR", cv2.resize(frame, (1280, 720)))
+        out.write(frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    # Sau khi xử lý xong video, ghi file CSV kết quả
+    try:
+        print("💾 Ghi kết quả ra CSV:", OUTPUT_CSV)
+        write_csv(results, OUTPUT_CSV)
+        print("✅ Ghi CSV hoàn tất.")
+    except Exception as e:
+        print("⚠️ Lỗi khi ghi CSV:", e)
+
+    cap.release()
+    out.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    # Khởi tạo MQTT client
+    client = mqtt.Client()
+    client.username_pw_set(ACCESS_TOKEN)
+    client.on_connect = on_connect
+    client.on_message = on_message
+    try:
+        client.connect(BROKER, PORT, 60)
+    except Exception as e:
+        print("❌ Không thể kết nối MQTT broker:", e)
+        # Vẫn tiếp tục chạy chế độ local (không có tín hiệu đèn)
+    client.loop_start()
+    try:
+        process_video()
+    finally:
+        client.loop_stop()
+        print("⏹️ Kết thúc chương trình.")
