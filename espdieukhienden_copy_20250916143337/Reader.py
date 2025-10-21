@@ -1,0 +1,392 @@
+import cv2
+import numpy as np
+from LCDetect import load_model, detect_lp, im2single
+import time
+from Contour import Contour
+
+class LPResult:
+    def __init__(self, image: np.ndarray, plate: str, type: int):
+        self.__image = image
+        self.__plate = plate
+        self.__type = type
+
+    def image(self) -> np.ndarray:
+        return self.__image
+
+    def plate(self) -> str:
+        return self.__plate
+
+    def type(self) -> int:
+        return self.__type
+
+    def type_str(self) -> str:
+        if self.__type == None:
+            return "Unknown"
+        return "Rectangle" if self.__type == Reader.RECTANGLE else "Square"
+
+    def __str__(self):
+        return f"Plate: {self.__plate}, Type: {self.type_str()}"
+
+    def __repr__(self):
+        return self.__str__()
+
+class Reader:
+
+    # Enum of license plate type
+    RECTANGLE = 1
+    SQUARE = 2
+
+    # Constants
+    SQ_PART_THRESHOLD = 0.5
+    CHARSET = "0123456789ABCDEFGHKLMNPRSTUVXYZ"
+    DMAX, DMIN = 608, 288
+    LP_THRESHOLD = 0.4
+    DIGIT_W, DIGIT_H = 30, 60
+
+    # Constants: Image processing parameters
+    CONTRAST_KERSIZE = 15
+    OPEN_KERSIZE = 6
+    MARGINS = {
+        "RECTANGLE": {
+            "TOP": 0.01,
+            "BOTTOM": 0.0,
+            "LEFT": 0.01,
+            "RIGHT": 0.0
+        },
+        "SQUARE": {
+            "TOP": 0.05,
+            "BOTTOM": 0.05,
+            "LEFT": 0.01,
+            "RIGHT": 0.01
+        }
+    }
+
+    # Constants: License plate parameters
+    RATIO_RANGE: tuple = (1.3, 4.5)
+    DIGIT_THRESHOLD = 0.3
+    DIGIT_THRESHOLD = {
+        "RECTANGLE": {
+            "MIN_HEIGHT": 0.3,
+            "MAX_WIDTH": 0.5
+        },
+
+        "SQUARE":{
+            "MIN_HEIGHT": 0.3,
+            "MAX_HEIGHT": 0.6,
+            "MIN_WIDTH": 0.05,
+            "MAX_WIDTH": 0.6
+        }
+    }
+    BPC_THRESHOLD = 0.6
+    WPC_THRESHOLD = 0.7
+
+    # Static variables for models
+    WPOD_NET_MODEL = None
+    WPOD_NET_PATH = "wpod-net_update1.json"
+    SVM_MODEL_PATH = "training/svm.xml"
+    SVM_MODEL = None
+    SVM_MODEL_PATH_DIGIT = "training/digit_only.xml"
+    SVM_MODEL_DIGIT = None
+
+    def __init__(self):
+        if Reader.WPOD_NET_MODEL is None:
+            Reader.WPOD_NET_MODEL = load_model(Reader.WPOD_NET_PATH)
+
+    def wpod():
+        if Reader.WPOD_NET_MODEL is None:
+            Reader.WPOD_NET_MODEL = load_model(Reader.WPOD_NET_PATH)
+        return Reader.WPOD_NET_MODEL
+
+    def svm():
+        if Reader.SVM_MODEL is None:
+            Reader.SVM_MODEL = cv2.ml.SVM_load(Reader.SVM_MODEL_PATH)
+        return Reader.SVM_MODEL
+
+    def svm_digit():
+        if Reader.SVM_MODEL_DIGIT is None:
+            Reader.SVM_MODEL_DIGIT = cv2.ml.SVM_load(Reader.SVM_MODEL_PATH_DIGIT)
+        return Reader.SVM_MODEL_DIGIT
+
+    def count_black_pixels(image: np.ndarray) -> int:
+        bpc = 0
+        try:
+            bpc = np.sum(image == 0)
+        except:
+            pass
+        finally:
+            return bpc
+
+    def get_border(image: np.ndarray):
+        top, bottom, left, right = 0, image.shape[0] - 1, 0, image.shape[1] - 1
+        # top:
+        while top < image.shape[0]:
+            total_white = np.sum(image[top, :] == 255)
+            if total_white/image.shape[1] < Reader.WPC_THRESHOLD:
+                break
+            top += 1
+
+        # bottom:
+        while bottom > int(image.shape[0] * 0.7):
+            total_white = np.sum(image[bottom, :] == 255)
+            if total_white/image.shape[1] < Reader.WPC_THRESHOLD:
+                break
+            bottom -= 1
+
+        # left:
+        while left < image.shape[1]:
+            total_white = np.sum(image[:, left] == 255)
+            if total_white/image.shape[0] < Reader.WPC_THRESHOLD:
+                break
+            left += 1
+
+        # right:
+        while right > int(image.shape[1] * 0.7):
+            total_white = np.sum(image[:, right] == 255)
+            if total_white/image.shape[0] < Reader.WPC_THRESHOLD:
+                break
+            right -= 1
+
+        return top, bottom, left, right
+
+    def process(image: np.ndarray) -> np.ndarray:
+        # Apply grayscale
+        if len(image.shape) == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+        # Enhance contrast with black hat and white hat
+        kernel_contrast = cv2.getStructuringElement(cv2.MORPH_RECT, (Reader.CONTRAST_KERSIZE, Reader.CONTRAST_KERSIZE))
+        blackhat = cv2.morphologyEx(image, cv2.MORPH_BLACKHAT, kernel_contrast)
+        tophat = cv2.morphologyEx(image, cv2.MORPH_TOPHAT, kernel_contrast)
+        image = cv2.add(image, tophat)
+        image = cv2.subtract(image, blackhat)
+
+        # Binarize the image
+        image = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+
+        # Open operation
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (Reader.OPEN_KERSIZE, Reader.OPEN_KERSIZE))
+        image = cv2.morphologyEx(image, cv2.MORPH_OPEN, kernel_open)
+
+        # Trim
+        top, bottom, left, right = Reader.get_border(image)
+        image = image[top:bottom, left:right]
+        return image, top, bottom, left, right
+
+    def sort_contours(contours: list, image: np.ndarray, type: int) -> list:
+        if type == Reader.RECTANGLE:
+            """
+            If the license plate is rectangle, sort the contours by horizontal position x
+            """
+            loc = []
+            for i in range(len(contours)):
+                loc.append(cv2.boundingRect(contours[i])[0])
+            contours = [x for _, x in sorted(
+                zip(loc, contours), key=lambda pair: pair[0])]
+            for i in range(len(contours)):
+                contours[i] = Contour(contours[i], False)
+            return contours
+
+        """
+        If the license plate is square, split the contours into two parts: upper and lower part
+        """
+        loc_top = []
+        loc_bot = []
+        im_height = image.shape[0]
+        for i in range(len(contours)):
+            x, y, w, h = cv2.boundingRect(contours[i])
+            x = x + w // 2
+            y = y + h // 2
+            if y < im_height * Reader.SQ_PART_THRESHOLD:
+                loc_top.append((i, x))
+            else:
+                loc_bot.append((i, x))
+        loc_top = sorted(loc_top, key=lambda pair: pair[1])
+        loc_bot = sorted(loc_bot, key=lambda pair: pair[1])
+        new_cnts = []
+        for i in range(len(loc_top)):
+            new_cnts.append(Contour(contours[loc_top[i][0]], False))
+        for i in range(len(loc_bot)):
+            new_cnts.append(Contour(contours[loc_bot[i][0]], True))
+        return new_cnts
+
+    def add_margins(image: np.ndarray, type: int) -> np.ndarray:
+        """
+        Add margins: make the image parts on the boundary turns black
+        """
+        margin = Reader.MARGINS["RECTANGLE"] if type == Reader.RECTANGLE else Reader.MARGINS["SQUARE"]
+        # Crop the image
+        im_height, im_width = image.shape[:2]
+        top = int(im_height * margin["TOP"])
+        bottom = int(im_height * margin["BOTTOM"])
+        left = int(im_width * margin["LEFT"])
+        right = int(im_width * margin["RIGHT"])
+        image = image[top:im_height - bottom, left:im_width - right]
+        return image
+
+    def remove_holes(conts: list, thresholded_img: np.ndarray) -> list:
+        """
+        Remove unwanted holes like in 0, 4, 6, 8, 9, etc.
+        """
+        rects = [cv2.boundingRect(c) for c in conts]
+        # A matrix of nan values len x len using just for without np
+        ref = [[0] * len(rects)] * len(rects)
+
+        for i in range(0, len(rects)):
+            for j in range(0, len(rects)):
+                if i == j:
+                    continue
+                # If the rec[j] is inside rec[i]
+                rec_frame = thresholded_img[rects[j][1]:rects[j][1] + rects[j][3], rects[j][0]:rects[j][0] + rects[j][2]]
+                # show the image
+                bpc = Reader.count_black_pixels(rec_frame)
+                if rects[i][0] < rects[j][0] and rects[i][1] < rects[j][1] and rects[i][2] > rects[j][2] and rects[i][3] > rects[j][3] and bpc > Reader.BPC_THRESHOLD * rects[j][2] * rects[j][3]:
+                    ref[i][j] = 1
+
+        removed_list = []
+        for j in range(len(rects)):
+            col_j = [ref[i][j] for i in range(len(rects))]
+            if 1 in col_j:
+                removed_list.append(j)
+
+        non_holes = []
+        for i in range(len(conts)):
+            if i not in removed_list:
+                non_holes.append(conts[i])
+        return non_holes
+
+    def filter(rect: tuple, im_height: int, im_width, lp_type: int) -> bool:
+        (x, y, w, h) = rect
+        ratio = h / w
+        if Reader.RATIO_RANGE[0] <= ratio <= Reader.RATIO_RANGE[1]:  # Chon cac contour dam bao ve ratio w/h
+            if lp_type == Reader.RECTANGLE:
+                d_thresh = Reader.DIGIT_THRESHOLD["RECTANGLE"]
+                if h/im_height >= d_thresh["MIN_HEIGHT"] and w/im_width <= d_thresh["MAX_WIDTH"]:
+                    return True
+            elif lp_type == Reader.SQUARE:
+                d_thresh = Reader.DIGIT_THRESHOLD["SQUARE"]
+                if h/im_height >= d_thresh["MIN_HEIGHT"] and h/im_height <= d_thresh["MAX_HEIGHT"] and w/im_width >= d_thresh["MIN_WIDTH"] and w/im_width <= d_thresh["MAX_WIDTH"]:
+                    return True
+        return False
+
+
+    def read(image: np.ndarray, plot = False, fname: str = "") -> str:
+        # Find the smaller dimension of the image
+        ratio = float(max(image.shape[:2])) / min(image.shape[:2])
+        side = int(ratio * Reader.DMIN)
+        bound_dim = min(side, Reader.DMAX)
+
+        _, LpImg, lp_type = detect_lp(Reader.wpod(), im2single(image), bound_dim, lp_threshold=Reader.LP_THRESHOLD)
+        model_svm = Reader.svm()
+        model_svm_digit = Reader.svm_digit()
+
+        if (len(LpImg)):
+            # Chuyen doi anh bien so
+            LpImg[0] = cv2.convertScaleAbs(LpImg[0], alpha=(255.0))
+            LpImg[0] = Reader.add_margins(LpImg[0], lp_type)
+
+            processed_img, tm, bm, lm, rm = Reader.process(LpImg[0])
+            LpImg[0] = LpImg[0][tm:bm, lm:rm]
+            roi = LpImg[0]
+            cont, _ = cv2.findContours(processed_img, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+            valid_contours = []
+            # Filter the contours
+            rects = [cv2.boundingRect(c) for c in cont]
+            for idx, r in enumerate(rects):
+                if Reader.filter(r, roi.shape[0], roi.shape[1], lp_type):
+                    valid_contours.append(cont[idx])
+
+            if plot:
+                cv2.drawContours(roi, valid_contours, -1, (0, 255, 0), 1)
+                cv2.imshow("Cac contour tim duoc", roi)
+                cv2.waitKey()
+
+            # Remove unwanted contours where considered as holes
+            valid_contours = Reader.remove_holes(valid_contours, processed_img)
+
+            lp_str = ""
+            valid_contours = Reader.sort_contours(valid_contours, roi, lp_type)
+            for idx in range(len(valid_contours)):
+                (x, y, w, h) = cv2.boundingRect((valid_contours[idx]).get_contour())
+                # Ve khung chu nhat quanh sol
+                cv2.rectangle(roi, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                # imshow the digit
+                if plot:
+                    cv2.imshow("Cac contour tim duoc", roi[y:y+h, x:x+w])
+                    cv2.waitKey()
+                # Tach so va predict
+                is_digit = (valid_contours[idx]).get_is_numeric()
+                curr_num = processed_img[y:y+h, x:x+w]
+                curr_num = cv2.resize(curr_num, dsize=(Reader.DIGIT_W, Reader.DIGIT_H))
+                _, curr_num = cv2.threshold(curr_num, 30, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                curr_num = np.array(curr_num, dtype=np.float32)
+                curr_num = curr_num.reshape(-1, Reader.DIGIT_W * Reader.DIGIT_H)
+
+                # Dua vao model SVM
+                result = "?"
+                if is_digit:
+                    result = model_svm_digit.predict(curr_num)[1]
+                else:
+                    result = model_svm.predict(curr_num)[1]
+                result = int(result[0, 0])
+                if result <= 9:  # Neu la so thi hien thi luon
+                    result = str(result)
+                elif result >= 65 and result <= 90:  # Neu la chu thi chuyen bang ASCII
+                    result = chr(result)
+                else:
+                    pass
+
+                lp_str += result
+
+            if plot:
+                cv2.imshow("Cac contour tim duoc", roi)
+                cv2.waitKey()
+            cv2.drawContours(roi, cont, -1, (0, 255, 0), 1)
+            cv2.imwrite("add_margins/" + fname, roi)
+            read_result = LPResult(roi, lp_str, lp_type)
+            return read_result
+
+        return LPResult(None, None, None)
+
+# if __name__ == "__main__":
+#     reader = Reader()
+#     loads = [""]
+#     start = time.time()
+#     for load in loads:
+#         image = cv2.imread(load)
+#         result = Reader.read(image, plot=True, fname="test.png")
+#         print(result)
+#         print("-------------------------------------------------")
+#     print("Time elapsed: ", time.time() - start)
+
+# Examinng:
+import os
+import time
+import pandas as pd
+if __name__ == "__main__":
+    reader = Reader()
+    files = os.listdir(r"E:\WPOD\img")
+    pred = []
+    start = time.time()
+    for file in files:
+        image = cv2.imread(rf"E:\WPOD\img\{file}")
+        result = Reader.read(image, plot=False, fname=file)
+        print("FILE: ", file, "RESULT: ", result)
+        pred.append(result)
+    print("Time elapsed: ", time.time() - start)
+
+    # Save to csv
+    df = pd.DataFrame(columns=["Image", "Plate", "Type", "Acc"])
+    df["Image"] = files
+    df["Plate"] = [p.plate() for p in pred]
+    df["Type"] = [p.type_str() for p in pred]
+    acc = []
+    for i in range(len(files)):
+        if files[i].split(".")[0] == pred[i].plate():
+            acc.append(1)
+        else:
+            acc.append(0)
+    df["Acc"] = acc
+    print("Accuraccy: ", sum(acc), "; as: ",sum(acc) / len(acc) * 100, "%")
+    df.to_csv("add_margins/result.csv", index=False)
+
