@@ -1,0 +1,205 @@
+import os
+import json
+import time
+import cv2
+import numpy as np
+import paho.mqtt.client as mqtt
+from ultralytics import YOLO
+from sort.sort import Sort
+from Reader import Reader
+from util import write_csv
+
+# ====== CẤU HÌNH ======
+ACCESS_TOKEN = "1lZGDfQeEZJ7UqV30cTh"
+BROKER = "demo.thingsboard.io"
+PORT = 1883
+
+VIDEO_PATH = "./1000.mp4"
+OUTPUT_PATH = "./output_violation.mp4"
+OUTPUT_CSV = "./results_output.csv"
+
+COCO_MODEL_WEIGHT = "yolov8n.pt"
+VEHICLE_CLASSES = [2, 3, 5, 7]  # car, motor, bus, truck
+VIOLATION_ZONE = [100, 1150, 2250, 1820]
+IOU_THRESHOLD_VIOLATION = 0.2
+CROP_EXPAND = 0.15  # mở rộng thêm 15%
+
+detecting = False  # Bật khi đèn đỏ
+
+# =================== MQTT CALLBACK ===================
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        print("✅ Kết nối ThingsBoard thành công!")
+        client.subscribe("v1/devices/me/attributes")
+        client.subscribe("v1/devices/me/rpc/request/+")
+    else:
+        print("❌ Kết nối MQTT thất bại, rc=", rc)
+
+def on_message(client, userdata, msg):
+    global detecting
+    payload = msg.payload.decode('utf-8')
+    print(f"[MQTT] Nhận topic: {msg.topic} | Payload: {payload}")
+    try:
+        data = json.loads(payload)
+        if "method" in data and data["method"] == "camera_action":
+            color = data["params"].get("traffic_light", "")
+            if color == "🔴":
+                detecting = True
+                print("🚨 ĐÈN ĐỎ: BẮT ĐẦU PHÁT HIỆN VI PHẠM")
+            else:
+                detecting = False
+                print("🟢/🟡: DỪNG NHẬN DIỆN VI PHẠM")
+    except Exception as e:
+        print("⚠️ Lỗi xử lý MQTT payload:", e)
+
+# =================== HÀM TÍNH TOÁN ===================
+def calculate_iou(box, zone):
+    xA = max(box[0], zone[0])
+    yA = max(box[1], zone[1])
+    xB = min(box[2], zone[2])
+    yB = min(box[3], zone[3])
+    interW = max(0, xB - xA)
+    interH = max(0, yB - yA)
+    interArea = interW * interH
+    if interArea == 0:
+        return 0.0
+    boxArea = (box[2] - box[0]) * (box[3] - box[1])
+    zoneArea = (zone[2] - zone[0]) * (zone[3] - zone[1])
+    return interArea / (boxArea + zoneArea - interArea + 1e-9)
+
+def expand_bbox(box, expand_ratio, frame_w, frame_h):
+    x1, y1, x2, y2 = box
+    w, h = x2 - x1, y2 - y1
+    dx, dy = w * expand_ratio, h * expand_ratio
+    ex1 = int(max(0, x1 - dx))
+    ey1 = int(max(0, y1 - dy))
+    ex2 = int(min(frame_w - 1, x2 + dx))
+    ey2 = int(min(frame_h - 1, y2 + dy))
+    return [ex1, ey1, ex2, ey2]
+
+# =================== XỬ LÝ VIDEO ===================
+def process_video():
+    print("🔁 Khởi tạo YOLO + SORT + Reader ...")
+    coco_model = YOLO(COCO_MODEL_WEIGHT)
+    mot_tracker = Sort()
+    reader = Reader()
+
+    cap = cv2.VideoCapture(VIDEO_PATH)
+    if not cap.isOpened():
+        print("❌ Không thể mở video:", VIDEO_PATH)
+        return
+
+    fps = int(cap.get(cv2.CAP_PROP_FPS) or 25)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    out = cv2.VideoWriter(OUTPUT_PATH, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+
+    frame_n = 0
+    results = {}
+    processed_violation_ids = set()
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame_n += 1
+        results[frame_n] = {}
+
+        # 1️⃣ YOLO detect
+        dets = coco_model(frame, conf=0.3)[0]
+        detections_ = []
+        for box in dets.boxes.data.tolist():
+            x1, y1, x2, y2, score, class_id = box
+            if int(class_id) in VEHICLE_CLASSES:
+                detections_.append([x1, y1, x2, y2, score])
+
+        # 2️⃣ SORT tracking
+        if len(detections_) > 0:
+            track_ids = mot_tracker.update(np.asarray(detections_))
+        else:
+            track_ids = mot_tracker.update(np.empty((0, 5)))
+
+        # 3️⃣ Vẽ vùng vi phạm
+        cv2.rectangle(frame, (VIOLATION_ZONE[0], VIOLATION_ZONE[1]),
+                      (VIOLATION_ZONE[2], VIOLATION_ZONE[3]), (0, 0, 255), 3)
+        cv2.putText(frame, "Violation Zone", (VIOLATION_ZONE[0], VIOLATION_ZONE[1] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+
+        # 4️⃣ Duyệt từng xe
+        for track in track_ids:
+            x1, y1, x2, y2, track_id = track
+            car_box = [int(x1), int(y1), int(x2), int(y2)]
+            iou = calculate_iou(car_box, VIOLATION_ZONE)
+            tid = int(track_id)
+            results[frame_n][tid] = {'car': {'bbox': car_box}}
+
+            if detecting and iou > IOU_THRESHOLD_VIOLATION:
+                color = (0, 0, 255)
+                label = f"VIOLATION #{tid}"
+                cv2.rectangle(frame, (car_box[0], car_box[1]), (car_box[2], car_box[3]), color, 3)
+                cv2.putText(frame, label, (car_box[0], car_box[1] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
+                # 5️⃣ Nhận diện biển số nếu chưa xử lý
+                if tid not in processed_violation_ids:
+                    ex1, ey1, ex2, ey2 = expand_bbox(car_box, CROP_EXPAND, width, height)
+                    crop = frame[ey1:ey2, ex1:ex2].copy()
+                    if crop.size == 0:
+                        continue
+                    try:
+                        print(f"🔎 Đọc biển số cho xe ID {tid} frame {frame_n} ...")
+                        lp_res = reader.read(crop, plot=False)
+                        plate_text = lp_res.plate()
+                        plate_type = lp_res.type_str()
+                        print(f"➡️ Biển: {plate_text} | Loại: {plate_type}")
+
+                        # Hiển thị biển số trực tiếp trên video
+                        if plate_text:
+                            cv2.putText(frame, plate_text, (car_box[0], car_box[1] - 40),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,0), 3)
+
+                        results[frame_n][tid]['license_plate'] = {
+                            'bbox': [ex1, ey1, ex2, ey2],
+                            'text': plate_text or "",
+                            'text_score': 1.0 if plate_text else 0.0
+                        }
+
+                        processed_violation_ids.add(tid)
+                    except Exception as e:
+                        print("⚠️ Lỗi đọc biển số:", e)
+            else:
+                # Xe bình thường
+                cv2.rectangle(frame, (car_box[0], car_box[1]), (car_box[2], car_box[3]), (0,255,0), 2)
+                cv2.putText(frame, f"ID {tid}", (car_box[0], car_box[1]-10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+
+        # 6️⃣ Hiển thị video
+        cv2.imshow("Traffic Monitoring + License Plate", cv2.resize(frame, (1280,720)))
+        out.write(frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    # Ghi kết quả CSV
+    print("💾 Ghi kết quả ra CSV...")
+    write_csv(results, OUTPUT_CSV)
+    cap.release()
+    out.release()
+    cv2.destroyAllWindows()
+
+# =================== MAIN ===================
+if __name__ == "__main__":
+    client = mqtt.Client()
+    client.username_pw_set(ACCESS_TOKEN)
+    client.on_connect = on_connect
+    client.on_message = on_message
+    try:
+        client.connect(BROKER, PORT, 60)
+    except Exception as e:
+        print("❌ Không thể kết nối MQTT:", e)
+
+    client.loop_start()
+    try:
+        process_video()
+    finally:
+        client.loop_stop()
+        print("⏹️ Kết thúc chương trình.")
