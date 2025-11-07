@@ -1,0 +1,224 @@
+from ultralytics import YOLO
+import cv2
+import numpy as np
+import json
+import os
+import paho.mqtt.client as mqtt
+from sort.sort import *
+from util import get_car, read_license_plate, write_csv
+
+# ============================ #
+# ⚙️ CẤU HÌNH MQTT + VIDEO     #
+# ============================ #
+ACCESS_TOKEN = "1lZGDfQeEZJ7UqV30cTh"
+BROKER = "demo.thingsboard.io"
+PORT = 1883
+OUTPUT_PATH = "./output_violation.mp4"
+
+# ============================ #
+# 📤 GỬI DỮ LIỆU LÊN THINGSBOARD #
+# ============================ #
+def send_violation(plate_text):
+    try:
+        payload = {"plate": plate_text}
+        client.publish("v1/devices/me/telemetry", json.dumps(payload))
+        print(f"🚀 Đã gửi lên ThingsBoard: {payload}")
+    except Exception as e:
+        print("❌ Lỗi khi gửi dữ liệu lên ThingsBoard:", e)
+
+# ============================ #
+# ⚙️ CẤU HÌNH YOLO & SORT      #
+# ============================ #
+coco_model = YOLO("yolov8n.pt")
+license_plate_detector = YOLO("./models/license_plate.pt")
+mot_tracker = Sort()
+
+vehicles = [2, 3, 5, 7]  # car, motorcycle, bus, truck
+detecting = False
+
+# ============================ #
+# 🧭 TỌA ĐỘ VÙNG VI PHẠM       #
+# ============================ #
+violation_zone = [300, 1550, 3250, 1820]
+
+# ============================ #
+# 📊 TÍNH IOU                  #
+# ============================ #
+def calculate_iou(box, zone):
+    xA = max(box[0], zone[0])
+    yA = max(box[1], zone[1])
+    xB = min(box[2], zone[2])
+    yB = min(box[3], zone[3])
+    interArea = max(0, xB - xA) * max(0, yB - yA)
+    if interArea == 0:
+        return 0.0
+    boxArea = (box[2] - box[0]) * (box[3] - box[1])
+    zoneArea = (zone[2] - zone[0]) * (zone[3] - zone[1])
+    return interArea / float(boxArea + zoneArea - interArea + 1e-6)
+
+# ============================ #
+# 🧠 XỬ LÝ VIDEO               #
+# ============================ #
+def process_video():
+    RASPBERRY_IP = "192.168.137.102"  # 🔥 đổi IP nếu khác
+    urls = [
+        f"http://{RASPBERRY_IP}:8080/?action=stream",
+        f"http://{RASPBERRY_IP}:8080/video",
+        f"http://{RASPBERRY_IP}:8080/stream"
+    ]
+
+    cap = None
+    for url in urls:
+        cap = cv2.VideoCapture(url)
+        if cap.isOpened():
+            print(f"✅ Kết nối camera thành công: {url}")
+            break
+    if cap is None or not cap.isOpened():
+        print("❌ Không thể mở camera Raspberry Pi!")
+        return
+
+    # Lấy thông tin video (fallback nếu không có)
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    if fps == 0:
+        fps = 20
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
+
+    print(f"📹 Video {width}x{height} @ {fps}fps")
+
+    out = cv2.VideoWriter(OUTPUT_PATH, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    os.makedirs("violations", exist_ok=True)
+
+    frame_nmr = 0
+    results = {}
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("⚠️ Không đọc được khung hình từ stream!")
+            break
+
+        frame_nmr += 1
+        results[frame_nmr] = {}
+
+        # 1️⃣ PHÁT HIỆN XE
+        detections = coco_model(frame, conf=0.3)[0]
+        detections_ = []
+        for det in detections.boxes.data.tolist():
+            x1, y1, x2, y2, score, class_id = det
+            if int(class_id) in vehicles:
+                detections_.append([x1, y1, x2, y2, score])
+
+        # 2️⃣ TRACKING
+        track_ids = mot_tracker.update(np.asarray(detections_)) if len(detections_) > 0 else mot_tracker.update(np.empty((0, 5)))
+
+        # 3️⃣ VẼ VÙNG VI PHẠM
+        cv2.rectangle(frame, (violation_zone[0], violation_zone[1]),
+                      (violation_zone[2], violation_zone[3]), (0, 0, 255), 3)
+        cv2.putText(frame, "Violation Zone",
+                    (violation_zone[0], violation_zone[1] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+        # 4️⃣ KIỂM TRA XE
+        for track in track_ids:
+            x1, y1, x2, y2, track_id = track
+            car_box = [x1, y1, x2, y2]
+            iou = calculate_iou(car_box, violation_zone)
+
+            if detecting and iou > 0.1:
+                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 3)
+                cv2.putText(frame, f"VIOLATION #{int(track_id)}",
+                            (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                            (0, 0, 255), 2)
+
+                # 5️⃣ BIỂN SỐ
+                license_plates = license_plate_detector(frame)[0]
+                for lp in license_plates.boxes.data.tolist():
+                    lx1, ly1, lx2, ly2, score, _ = lp
+                    xcar1, ycar1, xcar2, ycar2, car_id = get_car(lp, track_ids)
+                    if car_id == track_id:
+                        crop = frame[int(ly1):int(ly2), int(lx1):int(lx2), :]
+                        if crop.size == 0:
+                            continue
+
+                        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                        _, th = cv2.threshold(gray, 64, 255, cv2.THRESH_BINARY_INV)
+                        text, score_t = read_license_plate(th)
+
+                        if text:
+                            filename = f"violations/frame{frame_nmr}_id{int(track_id)}_{text}.jpg"
+                            cv2.imwrite(filename, crop)
+                            print(f"💾 Lưu ảnh biển số: {filename}")
+                            results[frame_nmr][car_id] = {
+                                "car": {"bbox": [xcar1, ycar1, xcar2, ycar2]},
+                                "license_plate": {"bbox": [lx1, ly1, lx2, ly2],
+                                                  "text": text,
+                                                  "bbox_score": score,
+                                                  "text_score": score_t}
+                            }
+                            cv2.putText(frame, text, (int(lx1), int(ly1) - 10),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+                            cv2.rectangle(frame, (int(lx1), int(ly1)), (int(lx2), int(ly2)), (255, 0, 0), 2)
+                            print(f"✅ [Frame {frame_nmr}] Xe #{track_id} - Biển: {text}")
+                            send_violation(text)
+            else:
+                cv2.rectangle(frame, (int(x1), int(y1)),
+                              (int(x2), int(y2)), (0, 255, 0), 2)
+                cv2.putText(frame, f"ID {int(track_id)}", (int(x1), int(y1) - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        # 6️⃣ HIỂN THỊ (hỗ trợ cả môi trường không GUI)
+        try:
+            cv2.imshow("Traffic Monitoring - Violation Detection", cv2.resize(frame, (1280, 720)))
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+        except cv2.error:
+            # Nếu không có GUI (Jupyter, VSCode), in log thay thế
+            from IPython.display import clear_output, display
+            import PIL.Image
+            display(PIL.Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+            clear_output(wait=True)
+
+
+    write_csv(results, "./violation_results.csv")
+    cap.release()
+    out.release()
+    cv2.destroyAllWindows()
+
+# ============================ #
+# 🔔 MQTT CALLBACKS             #
+# ============================ #
+def on_connect(client, userdata, flags, rc):
+    print("✅ Kết nối ThingsBoard thành công!" if rc == 0 else f"❌ Lỗi kết nối: {rc}")
+    client.subscribe("v1/devices/me/rpc/request/+")
+
+def on_message(client, userdata, msg):
+    global detecting
+    payload = msg.payload.decode("utf-8")
+    print(f"[MQTT] Topic: {msg.topic} | {payload}")
+    try:
+        data = json.loads(payload)
+        if "method" in data and data["method"] == "setLight":
+            color = data.get("params", "").upper()
+            if color == "RED":
+                detecting = True
+                print("🚨 ĐÈN ĐỎ - BẮT ĐẦU NHẬN DIỆN VI PHẠM")
+            else:
+                detecting = False
+                print(f"🟢 ĐÈN {color} - DỪNG NHẬN DIỆN")
+    except Exception as e:
+        print("⚠️ Lỗi xử lý MQTT:", e)
+
+# ============================ #
+# 🏁 CHẠY CHÍNH                #
+# ============================ #
+if __name__ == "__main__":
+    client = mqtt.Client()
+    client.username_pw_set(ACCESS_TOKEN)
+    client.on_connect = on_connect
+    client.on_message = on_message
+    client.connect(BROKER, PORT, 60)
+
+    client.loop_start()
+    process_video()
+    client.loop_stop()
