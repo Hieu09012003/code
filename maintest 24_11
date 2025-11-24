@@ -1,0 +1,241 @@
+from ultralytics import YOLO
+import cv2
+import numpy as np
+import os
+from sort.sort import *
+# Thêm thư viện CSV
+import csv
+# Giả định lp_reader có định nghĩa read_license_plate_from_file
+from lp_reader import read_license_plate_from_file
+
+# ============================ #
+# ⚙️ CẤU HÌNH VIDEO & MÔ HÌNH  #
+# ============================ #
+VIDEO_PATH = "./1000.mp4"
+OUTPUT_PATH = "./output_detection.mp4"
+VIOLATION_DIR = "captured_plates_final"     # Thư mục lưu ảnh biển số đã cắt
+PLATE_EXPANSION_FACTOR = 0.5                 # Tỷ lệ mở rộng ảnh biển số (50% mỗi chiều)
+# Đường dẫn file CSV mới
+SUMMARY_OUTPUT_PATH = "./violation_summary.csv" 
+
+# ============================ #
+# ⚙️ CẤU HÌNH YOLO & SORT      #
+# ============================ #
+# Đảm bảo các model này đã được tải về
+coco_model = YOLO("yolov8n.pt")
+license_plate_detector = YOLO("./models/license_plate.pt")
+mot_tracker = Sort()
+
+vehicles = [2, 3, 5, 7]  # car, motorcycle, bus, truck
+detecting = True         # ✅ Tự động ở trạng thái "Đèn đỏ"
+
+# ============================ #
+# 🧭 TỌA ĐỘ VÙNG VI PHẠM      #
+# [X_min, Y_min, X_max, Y_max]
+# ============================ #
+violation_zone = [700, 1400, 2900, 1800]
+
+# ============================ #
+# 📊 HÀM TÍNH IOU              #
+# ============================ #
+def calculate_iou(box, zone):
+    xA = max(box[0], zone[0])
+    yA = max(box[1], zone[1])
+    xB = min(box[2], zone[2])
+    yB = min(box[3], zone[3])
+    interArea = max(0, xB - xA) * max(0, yB - yA)
+    if interArea == 0:
+        return 0.0
+    boxArea = (box[2] - box[0]) * (box[3] - box[1])
+    zoneArea = (zone[2] - zone[0]) * (zone[3] - zone[1])
+    iou = interArea / float(boxArea + zoneArea - interArea + 1e-6)
+    return iou
+
+# ============================ #
+# 💾 HÀM GHI TÓM TẮT CSV       #
+# ============================ #
+def write_violation_summary_csv(violation_records, summary_output_path):
+    """
+    Tạo file summary thống kê các biển số vi phạm duy nhất, bao gồm biển số thô, đã xử lý và loại biển số.
+    violation_records là list các dictionary: 
+    [{'plate_final': '...', 'plate_raw': '...', 'plate_type': '...', 'track_id': '...', 'frame_nmr': '...'}, ...]
+    """
+    violated_plates = {}
+    for record in violation_records:
+        plate_final = record['plate_final']
+        
+        # Dùng biển số đã xử lý để định danh duy nhất (chống trùng lặp)
+        if plate_final and plate_final not in violated_plates:
+            violated_plates[plate_final] = {
+                'first_seen_frame': record['frame_nmr'],
+                'track_id': record['track_id'],
+                'plate_raw': record['plate_raw'],
+                # 🆕 Bổ sung trường loại biển số
+                'plate_type': record['plate_type'] 
+            }
+
+    with open(summary_output_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        # 🆕 Cập nhật tiêu đề cột: Thêm 'license_number_type'
+        writer.writerow(['license_number_final', 'license_number_raw', 'license_number_type', 'track_id', 'first_seen_frame'])
+        
+        for plate_final, info in violated_plates.items():
+            # 🆕 Ghi thêm info['plate_type']
+            writer.writerow([plate_final, info['plate_raw'], info['plate_type'], info['track_id'], info['first_seen_frame']])
+
+# ============================ #
+# 🧠 XỬ LÝ VIDEO CHÍNH         #
+# ============================ #
+def process_video():
+    # 1. Khởi tạo Video Capture/Writer và thư mục
+    cap = cv2.VideoCapture(VIDEO_PATH)
+    if not cap.isOpened():
+        print("❌ Không thể mở video!")
+        return
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    out = cv2.VideoWriter(OUTPUT_PATH, fourcc, fps, (width, height))
+    os.makedirs(VIOLATION_DIR, exist_ok=True)
+
+    frame_nmr = 0
+    # 🔑 Dùng set để lưu trữ ID của các xe đã chụp, đảm bảo mỗi ID chỉ có 1 lần.
+    captured_track_ids = set() 
+    # 🆕 Danh sách lưu trữ các record vi phạm
+    violation_records = [] 
+
+    print(f"📹 Video {width}x{height} @ {fps}fps. Bắt đầu xử lý...")
+    print(f"🎯 Vùng vi phạm: {violation_zone}")
+    print(f"📏 Tỷ lệ mở rộng biển số: {PLATE_EXPANSION_FACTOR * 100}%")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame_nmr += 1
+
+        # 2. PHÁT HIỆN XE & TRACKING 
+        detections = coco_model(frame, conf=0.08)[0]
+        detections_ = []
+        for det in detections.boxes.data.tolist():
+            x1, y1, x2, y2, score, class_id = det
+            if int(class_id) in vehicles:
+                detections_.append([x1, y1, x2, y2, score])
+        
+        if len(detections_) > 0:
+            track_ids = mot_tracker.update(np.asarray(detections_))
+        else:
+            track_ids = mot_tracker.update(np.empty((0, 5)))
+        # 3. VẼ VÙNG VI PHẠM
+        cv2.rectangle(frame, (violation_zone[0], violation_zone[1]),
+                      (violation_zone[2], violation_zone[3]), (0, 0, 255), 3)
+
+        # 4. KIỂM TRA & CHỤP ẢNH BIỂN SỐ
+        license_plates = None 
+        
+        for track in track_ids:
+            x1, y1, x2, y2, track_id = track
+            car_box = [x1, y1, x2, y2]
+            iou = calculate_iou(car_box, violation_zone)
+            current_track_id = int(track_id)
+
+            # 🚨 ĐIỀU KIỆN CHÍNH CHỐNG LẶP
+            if detecting and iou > 0.05 and current_track_id not in captured_track_ids:
+                
+                # 🚨 Đánh dấu xe vi phạm
+                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 3)
+                
+                # 5. PHÁT HIỆN BIỂN SỐ
+                if license_plates is None:
+                    license_plates = license_plate_detector(frame)[0]
+                
+                for license_plate in license_plates.boxes.data.tolist():
+                    lx1, ly1, lx2, ly2, score, class_id = license_plate
+                    
+                    # --- PHẦN MỞ RỘNG ẢNH BIỂN SỐ ---
+                    lp_width = lx2 - lx1
+                    lp_height = ly2 - ly1
+                    expand_x = lp_width * PLATE_EXPANSION_FACTOR
+                    expand_y = lp_height * PLATE_EXPANSION_FACTOR
+                    
+                    expanded_lx1 = max(0, int(lx1 - expand_x))
+                    expanded_ly1 = max(0, int(ly1 - expand_y))
+                    expanded_lx2 = min(width, int(lx2 + expand_x))
+                    expanded_ly2 = min(height, int(ly2 + expand_y))
+                    
+                    license_plate_crop = frame[expanded_ly1:expanded_ly2, expanded_lx1:expanded_lx2, :]
+                    
+                    if license_plate_crop.size > 0:
+                        # 🖼️ LƯU ẢNH BIỂN SỐ
+                        filename = f"{VIOLATION_DIR}/frame{frame_nmr}_id{current_track_id}_lp.jpg"
+                        cv2.imwrite(filename, license_plate_crop)
+                        
+                        # ===============================================
+                        # 🚨 GỌI HÀM NHẬN DẠNG VÀ LẤY KẾT QUẢ
+                        # ===============================================
+                        recognition_result = read_license_plate_from_file(filename)
+                        plate_final = recognition_result.plate() # Kết quả đã xử lý/final
+                        
+                        # Giả định: Thử lấy kết quả thô. Nếu không có, dùng kết quả final
+                        try:
+                            plate_raw = recognition_result.plate_raw() 
+                        except AttributeError:
+                            plate_raw = plate_final 
+
+                        # 🆕 Thử lấy loại biển số. Nếu không có, dùng chuỗi rỗng.
+                        try:
+                            plate_type = recognition_result.type_str()
+                        except AttributeError:
+                            plate_type = ""
+                            
+                        # 🔑 THÊM ID VÀO SET SAU KHI CHỤP THÀNH CÔNG
+                        captured_track_ids.add(current_track_id) 
+
+                        # 💾 LƯU RECORD VÀO DANH SÁCH
+                        # 🆕 Bổ sung 'plate_type'
+                        violation_records.append({
+                            'plate_final': plate_final,
+                            'plate_raw': plate_raw,
+                            'plate_type': plate_type, 
+                            'track_id': current_track_id,
+                            'frame_nmr': frame_nmr
+                        })
+                        
+                        print(f"💾 [Frame {frame_nmr}] Đã chụp xe #{current_track_id} (DUY NHẤT): {filename}")
+                        print(f"       ➡️ KẾT QUẢ NHẬN DẠNG: FINAL: {plate_final} | RAW: {plate_raw} | LOẠI: {plate_type}")
+                        
+                        # Hiển thị bounding box biển số đã mở rộng
+                        cv2.rectangle(frame, (expanded_lx1, expanded_ly1), (expanded_lx2, expanded_ly2), (255, 0, 0), 2)
+                        
+                        break # Chỉ chụp một biển số/xe
+            
+            else:
+                # 🟢 XE HỢP LỆ (hoặc đã chụp)
+                cv2.rectangle(frame, (int(x1), int(y1)),
+                              (int(x2), int(y2)), (0, 255, 0), 2)
+                
+        # 6. HIỂN THỊ VÀ GHI VIDEO 
+        frame_disp = cv2.resize(frame, (1280, 720))
+        cv2.imshow("Traffic Monitoring - Final Version", frame_disp)
+        out.write(frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    # 7. Kết thúc
+    print(f"Hoàn tất xử lý video. Tổng số xe đã chụp: {len(captured_track_ids)}")
+    cap.release()
+    out.release()
+    cv2.destroyAllWindows()
+    
+    # 🆕 GỌI HÀM GHI CSV SAU KHI KẾT THÚC VÒNG LẶP CHÍNH
+    write_violation_summary_csv(violation_records, SUMMARY_OUTPUT_PATH)
+    print(f"✅ Đã tạo file tổng hợp vi phạm: {SUMMARY_OUTPUT_PATH}")
+
+# ============================ #
+# 🏁 CHẠY CHƯƠNG TRÌNH CHÍNH   #
+# ============================ #
+if __name__ == "__main__":
+    process_video()
