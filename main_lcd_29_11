@@ -1,0 +1,388 @@
+from ultralytics import YOLO
+import cv2
+import numpy as np
+import json
+import os
+import csv
+import time
+import socket
+import paho.mqtt.client as mqtt # ⬅️ THÊM: Import MQTT
+# KHÔNG CẦN import threading, Picamera2, FrameBuffer trên PC
+
+from sort.sort import *
+# Giả định module lp_reader đã được cài đặt và có hàm read_license_plate_from_file
+from lp_reader import read_license_plate_from_file 
+
+# ============================ #
+# ⚙️ CẤU HÌNH STREAM TRÊN PC   #
+# ============================ #
+# 🚨 THAY THẾ ĐỊA CHỈ IP VÀ PORT CỦA RASPBERRY PI CỦA BẠN
+PI_IP_ADDRESS = "172.20.10.4" # Ví dụ: Thay bằng IP thực tế của Pi
+PORT_STREAM = 8000
+STREAM_URL = f"http://{PI_IP_ADDRESS}:{PORT_STREAM}/stream.mjpg" 
+
+PORT_LCD = 65432
+
+VIOLATION_DIR = "captured_plates" # Đã bỏ "always_red" vì giờ có thể thay đổi
+PLATE_EXPANSION_FACTOR = 0.7           
+SUMMARY_OUTPUT_PATH = "./violation_summary.csv" # Đã bỏ "always_red"
+
+# Kích thước khung hình mặc định của Stream (phải khớp với Pi server)
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
+
+# ============================ #
+# ⚙️ CẤU HÌNH THINGSBOARD/MQTT # ⬅️ THÊM: Cấu hình ThingsBoard
+# ============================ #
+ACCESS_TOKEN = "1lZGDfQeEZJ7UqV30cTh" # Thay bằng Access Token của bạn
+BROKER = "demo.thingsboard.io"
+PORT_MQTT = 1883
+client = None # Biến client MQTT toàn cục
+
+# ============================ #
+# ⚙️ CẤU HÌNH YOLO & SORT       #
+# ============================ #
+# Khởi tạo mô hình
+coco_model = YOLO("yolov8n.pt")
+license_plate_detector = YOLO("./models/license_plate.pt")
+mot_tracker = Sort()
+
+vehicles = [2, 3, 5, 7]  # car, motorcycle, bus, truck
+# 🚦 Trạng thái đèn đỏ: Ban đầu mặc định TẮT (Green/Yellow)
+# Biến này sẽ được cập nhật bởi ThingsBoard RPC
+DETECT_VIOLATION = False         
+
+# ============================ #
+# 🧭 TỌA ĐỘ VÙNG VI PHẠM      #
+# ============================ #
+# Cần điều chỉnh tọa độ này cho khung hình 640x480
+violation_zone = [100, 300, 600, 400]  # [x1, y1, x2, y2] cho 640x480
+
+# ============================ #
+# 📤 HÀM GỬI DỮ LIỆU LÊN THINGSBOARD # ⬅️ THÊM: Hàm gửi
+# ============================ #
+def send_violation(plate_text):
+    """Gửi biển số vi phạm lên ThingsBoard."""
+    global client
+    if client:
+        try:
+            payload = {"plate": plate_text}
+            client.publish("v1/devices/me/telemetry", json.dumps(payload))
+            print(f"🚀 Đã gửi lên ThingsBoard: {payload}")
+        except Exception as e:
+            print("❌ Lỗi khi gửi dữ liệu lên ThingsBoard:", e)
+
+# 2. ⬅️ THÊM: Gửi sang Raspberry Pi (LCD)
+def send_to_pi_lcd(plate_text):
+    """Gửi chuỗi biển số sang Raspberry Pi qua Socket LAN"""
+    try:
+        # Tạo kết nối socket ngắn hạn
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(2) # Timeout sau 2 giây nếu Pi không phản hồi
+            s.connect((PI_IP_ADDRESS, PORT_LCD))
+            s.sendall(plate_text.encode('utf-8'))
+            print(f"🖥️ [LCD] Đã gửi '{plate_text}' sang Pi để hiển thị.")
+    except Exception as e:
+        print(f"⚠️ Không thể gửi tin hiệu ra LCD (Kiểm tra file lcd_server.py trên Pi): {e}")
+
+# ============================ #
+# 📊 HÀM TÍNH IOU #
+# ============================ #
+def calculate_iou(box, zone):
+    xA = max(box[0], zone[0])
+    yA = max(box[1], zone[1])
+    xB = min(box[2], zone[2])
+    yB = min(box[3], zone[3])
+    interArea = max(0, xB - xA) * max(0, yB - yA)
+    if interArea == 0:
+        return 0.0
+    boxArea = (box[2] - box[0]) * (box[3] - box[1])
+    zoneArea = (zone[2] - zone[0]) * (zone[3] - zone[1])
+    iou = interArea / float(boxArea + zoneArea - interArea + 1e-6)
+    return iou
+
+# ============================ #
+# 💾 HÀM GHI TÓM TẮT CSV #
+# ============================ #
+def write_violation_summary_csv(violation_records, summary_output_path):
+    """
+    Tạo file summary thống kê các biển số vi phạm duy nhất.
+    """
+    violated_plates = {}
+    for record in violation_records:
+        plate_final = record['plate_final']
+        
+        # Chỉ ghi nếu có biển số nhận dạng được
+        if plate_final and plate_final not in violated_plates:
+            violated_plates[plate_final] = {
+                'first_seen_frame': record['frame_nmr'],
+                'track_id': record['track_id'],
+                'plate_raw': record['plate_raw'],
+                'plate_type': record['plate_type'] 
+            }
+
+    with open(summary_output_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['license_number_final', 'license_number_raw', 'license_number_type', 'track_id', 'first_seen_frame'])
+        
+        for plate_final, info in violated_plates.items():
+            writer.writerow([plate_final, info['plate_raw'], info['plate_type'], info['track_id'], info['first_seen_frame']])
+
+# ============================ #
+# 🔔 MQTT CALLBACKS            # ⬅️ THÊM: Callback MQTT
+# ============================ #
+def on_connect(client, userdata, flags, rc):
+    print("✅ Kết nối ThingsBoard thành công!" if rc == 0 else f"❌ Lỗi kết nối: {rc}")
+    # Đăng ký lắng nghe lệnh RPC từ ThingsBoard
+    if rc == 0:
+        client.subscribe("v1/devices/me/rpc/request/+")
+
+def on_message(client, userdata, msg):
+    """Xử lý lệnh RPC từ ThingsBoard để thay đổi trạng thái DETECT_VIOLATION."""
+    global DETECT_VIOLATION
+    payload = msg.payload.decode("utf-8")
+    print(f"[MQTT] Topic: {msg.topic} | {payload}")
+    try:
+        data = json.loads(payload)
+        if "method" in data and data["method"] == "setLight":
+            color = data.get("params", "").upper()
+            if color == "RED":
+                DETECT_VIOLATION = True
+                print("🚨 ĐÈN ĐỎ - BẮT ĐẦU NHẬN DIỆN VI PHẠM")
+            else:
+                DETECT_VIOLATION = False
+                print(f"🟢 ĐÈN {color} - DỪNG NHẬN DIỆN")
+            
+            # Phản hồi lại RPC
+            response = json.dumps({"status": "Success", "light": color})
+            client.publish(msg.topic.replace("request", "response"), response)
+            
+    except Exception as e:
+        print("⚠️ Lỗi xử lý MQTT:", e)
+
+# ============================ #
+# 🧠 XỬ LÝ FEED CAMERA TRỰC TIẾP #
+# ============================ #
+def process_camera_feed(stream_url):
+    """
+    Hàm chính để xử lý khung hình nhận được từ Camera Stream.
+    """
+    # Khởi tạo VideoCapture để đọc từ URL stream
+    cap = cv2.VideoCapture(stream_url)
+    if not cap.isOpened():
+        print(f"❌ KHÔNG THỂ KẾT NỐI VỚI STREAM: {stream_url}")
+        print("Đảm bảo Pi server đang chạy và IP/Port chính xác.")
+        return
+
+    # Tạo thư mục nếu chưa có
+    os.makedirs(VIOLATION_DIR, exist_ok=True) 
+
+    frame_nmr = 0
+    captured_track_ids = set() 
+    violation_records = []
+    
+    print(f"📹 Đã kết nối. Khởi động xử lý video trực tiếp từ {stream_url}...")
+
+    while True:
+        ret, frame = cap.read()
+        
+        if not ret or frame is None:
+            print("⚠️ Mất kết nối Stream hoặc không nhận được frame.")
+            time.sleep(1)
+            # Thử kết nối lại
+            cap.release()
+            cap = cv2.VideoCapture(stream_url)
+            if not cap.isOpened():
+                break
+            continue
+            
+        height, width, _ = frame.shape
+        frame_nmr += 1
+        
+        # ⭐ BẢN SAO SẠCH CỦA FRAME DÙNG ĐỂ CẮT ẢNH BIỂN SỐ
+        clean_frame = frame.copy() 
+
+        # 1. PHÁT HIỆN XE & TRACKING
+        detections = coco_model(frame, conf=0.1, verbose=False)[0] 
+        detections_ = []
+        for det in detections.boxes.data.tolist():
+            x1, y1, x2, y2, score, class_id = det
+            if int(class_id) in vehicles:
+                detections_.append([x1, y1, x2, y2, score])
+        
+        if len(detections_) > 0:
+            track_ids = mot_tracker.update(np.asarray(detections_))
+        else:
+            track_ids = mot_tracker.update(np.empty((0, 5)))
+
+        # 2. VẼ VÙNG VI PHẠM
+        zone_color = (0, 0, 255) if DETECT_VIOLATION else (0, 255, 255) # Đỏ khi đèn đỏ, Vàng khi đèn xanh/vàng
+        cv2.rectangle(frame, (violation_zone[0], violation_zone[1]),
+                      (violation_zone[2], violation_zone[3]), zone_color, 3)
+        cv2.putText(frame, "Violation Zone (RED light)" if DETECT_VIOLATION else "Zone (GREEN/YELLOW light)",
+                    (violation_zone[0], violation_zone[1] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, zone_color, 2)
+
+        license_plates = None 
+
+        # 3. KIỂM TRA TỪNG XE & LOGIC CHỤP
+        for track in track_ids:
+            x1, y1, x2, y2, track_id = track
+            car_box = [x1, y1, x2, y2]
+            iou = calculate_iou(car_box, violation_zone)
+            current_track_id = int(track_id)
+
+            # 🚨 ĐIỀU KIỆN CHÍNH: Trong vùng vi phạm VÀ ĐÈN ĐỎ VÀ chưa từng chụp
+            if DETECT_VIOLATION and iou > 0.08 and current_track_id not in captured_track_ids:
+                
+                # Đánh dấu xe vi phạm (màu đỏ)
+                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 3)
+                cv2.putText(frame, f"VIOLATION #{current_track_id}",
+                            (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                            (0, 0, 255), 2)
+                
+                # 4. PHÁT HIỆN BIỂN SỐ
+                if license_plates is None:
+                    license_plates = license_plate_detector(clean_frame, verbose=False)[0] 
+                
+                for license_plate in license_plates.boxes.data.tolist():
+                    lx1, ly1, lx2, ly2, score, class_id = license_plate
+                    
+                    # --- MỞ RỘNG VÙNG CẮT ---
+                    lp_width = lx2 - lx1
+                    lp_height = ly2 - ly1
+                    expand_x = lp_width * PLATE_EXPANSION_FACTOR
+                    expand_y = lp_height * PLATE_EXPANSION_FACTOR
+                    
+                    expanded_lx1 = max(0, int(lx1 - expand_x))
+                    expanded_ly1 = max(0, int(ly1 - expand_y))
+                    expanded_lx2 = min(width, int(lx2 + expand_x))
+                    expanded_ly2 = min(height, int(ly2 + expand_y))
+                    
+                    # Cắt ảnh biển số
+                    license_plate_crop = clean_frame[expanded_ly1:expanded_ly2, expanded_lx1:expanded_lx2, :]
+                    
+                    if license_plate_crop.size > 0:
+                        # -----------------------------------------------------
+                        # 🖼️ BƯỚC 1: LƯU TÊN TẠM THỜI (để đọc được file)
+                        # -----------------------------------------------------
+                        temp_filename = f"{VIOLATION_DIR}/temp_frame{frame_nmr}_id{current_track_id}.jpg"
+                        cv2.imwrite(temp_filename, license_plate_crop)
+                        
+                        # -----------------------------------------------------
+                        # 🚨 BƯỚC 2: GỌI HÀM NHẬN DẠNG TỪ FILE TẠM
+                        # -----------------------------------------------------
+                        recognition_result = read_license_plate_from_file(temp_filename)
+                        plate_final = recognition_result.plate() 
+                        
+                        try:
+                            plate_raw = recognition_result.plate_raw() 
+                        except AttributeError:
+                            plate_raw = plate_final 
+
+                        try:
+                            plate_type = recognition_result.type_str()
+                        except AttributeError:
+                            plate_type = ""
+                            
+                        # -----------------------------------------------------
+                        # ✏️ BƯỚC 3: ĐỔI TÊN FILE THÀNH BIỂN SỐ
+                        # -----------------------------------------------------
+                        final_filename = temp_filename # Mặc định giữ tên tạm
+                        
+                        if plate_final: # Nếu đọc được biển số
+                            new_filename = f"{VIOLATION_DIR}/{plate_final}.jpg"
+                            
+                            # Nếu file biển số đã tồn tại (xe đi qua lại), xóa file cũ
+                            if os.path.exists(new_filename):
+                                try:
+                                    os.remove(new_filename)
+                                except OSError:
+                                    pass
+                            
+                            # Đổi tên file tạm -> tên biển số
+                            try:
+                                os.rename(temp_filename, new_filename)
+                                final_filename = new_filename
+                            except OSError as e:
+                                print(f"⚠️ Không thể đổi tên file: {e}")
+
+                            # 🚀 GỬI DỮ LIỆU LÊN THINGSBOARD # ⬅️ THÊM: Gửi dữ liệu
+                            send_violation(plate_final)
+                            # 🖥️ GỬI SANG PI LCD # ⬅️ THÊM: Gửi sang Pi LCD
+                            send_to_pi_lcd(plate_final)
+                        
+                        # -----------------------------------------------------
+                        
+                        # Thêm ID vào danh sách đã chụp
+                        captured_track_ids.add(current_track_id) 
+
+                        # Lưu record
+                        violation_records.append({
+                            'plate_final': plate_final,
+                            'plate_raw': plate_raw,
+                            'plate_type': plate_type, 
+                            'track_id': current_track_id,
+                            'frame_nmr': frame_nmr
+                        })
+                        
+                        print(f"💾 [Frame {frame_nmr}] Đã chụp xe #{current_track_id}")
+                        print(f"       ➡️ File: {final_filename}")
+                        print(f"       ➡️ Biển số: {plate_final}")
+                        
+                        # Vẽ khung biển số trên video
+                        cv2.rectangle(frame, (expanded_lx1, expanded_ly1), (expanded_lx2, expanded_ly2), (255, 0, 0), 2)
+                        
+                        break # Chỉ chụp 1 biển/xe
+            
+            else:
+                # 🟢 XE HỢP LỆ (hoặc đèn xanh/vàng, hoặc đã chụp)
+                color = (0, 255, 0) # Xanh lá cây
+                if current_track_id in captured_track_ids:
+                    color = (255, 255, 0) # Cyan nếu đã chụp rồi
+                
+                cv2.rectangle(frame, (int(x1), int(y1)),
+                              (int(x2), int(y2)), color, 2)
+                cv2.putText(frame, f"ID {int(track_id)}", (int(x1), int(y1) - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+        # 5. HIỂN THỊ TRỰC TIẾP
+        frame_disp = cv2.resize(frame, (800, 600)) # Hiển thị ở kích thước lớn hơn
+        cv2.imshow("Traffic Monitoring (Live) - PC Client", frame_disp)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+            
+    # 6. KẾT THÚC
+    print(f"Hoàn tất xử lý. Tổng số xe đã chụp: {len(captured_track_ids)}")
+    cap.release()
+    cv2.destroyAllWindows()
+    
+    write_violation_summary_csv(violation_records, SUMMARY_OUTPUT_PATH)
+    print(f"✅ Đã tạo file tổng hợp vi phạm: {SUMMARY_OUTPUT_PATH}")
+
+# ============================ #
+# 🏁 CHẠY CHƯƠNG TRÌNH CHÍNH  #
+# ============================ #
+if __name__ == "__main__":
+    
+    # 🔔 KHỞI TẠO VÀ KẾT NỐI MQTT
+    client = mqtt.Client()
+    client.username_pw_set(ACCESS_TOKEN)
+    client.on_connect = on_connect
+    client.on_message = on_message
+    
+    try:
+        client.connect(BROKER, PORT_MQTT, 60)
+        client.loop_start()
+        print("💡 Đang cố gắng kết nối MQTT...")
+    except Exception as e:
+        print(f"❌ Lỗi kết nối MQTT: {e}")
+        
+    # Bắt đầu xử lý stream
+    process_camera_feed(STREAM_URL)
+    
+    # Dừng vòng lặp MQTT khi kết thúc xử lý
+    if client:
+        client.loop_stop()
+        print("💡 Đã ngắt kết nối MQTT.")
