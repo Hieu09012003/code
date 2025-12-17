@@ -18,12 +18,12 @@ from lp_reader import read_license_plate_from_file
 # ============================ #
 # 🚨 THAY THẾ ĐỊA CHỈ IP VÀ PORT CỦA RASPBERRY PI CỦA BẠN
 PI_IP_ADDRESS = "172.20.10.4" # Ví dụ: Thay bằng IP thực tế của Pi
-PORT_STREAM = 8000
-STREAM_URL = f"http://{PI_IP_ADDRESS}:{PORT_STREAM}/stream.mjpg" 
+VIDEO_PATH = "./10.mp4"
+OUTPUT_PATH = "./output_violation_final_fixed.mp4" 
 
 PORT_LCD = 65432
 
-VIOLATION_DIR = "Results_violation" 
+VIOLATION_DIR = "captured_plates" # Đã bỏ "always_red" vì giờ có thể thay đổi
 PLATE_EXPANSION_FACTOR = 0.7           
 SUMMARY_OUTPUT_PATH = "./violation_summary.csv" # Đã bỏ "always_red"
 
@@ -56,7 +56,7 @@ DETECT_VIOLATION = False
 # 🧭 TỌA ĐỘ VÙNG VI PHẠM      #
 # ============================ #
 # Cần điều chỉnh tọa độ này cho khung hình 640x480
-violation_zone = [100, 300, 600, 400]  # [x1, y1, x2, y2] cho 640x480
+violation_zone = [400, 2600, 1800, 3000]  # [x1, y1, x2, y2] cho 640x480
 
 # ============================ #
 # 📤 HÀM GỬI DỮ LIỆU LÊN THINGSBOARD # ⬅️ THÊM: Hàm gửi
@@ -380,7 +380,7 @@ if __name__ == "__main__":
         print(f"❌ Lỗi kết nối MQTT: {e}")
         
     # Bắt đầu xử lý stream
-    process_camera_feed(STREAM_URL)
+    process_camera_feed(VIDEO_PATH)
     
     # Dừng vòng lặp MQTT khi kết thúc xử lý
     if client:
