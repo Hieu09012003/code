@@ -14,9 +14,9 @@ from lp_reader import read_license_plate_from_file
 # ⚙️ CẤU HÌNH STREAM TRÊN PC   #
 # ============================ #
 # 🚨 THAY THẾ ĐỊA CHỈ IP VÀ PORT CỦA RASPBERRY PI CỦA BẠN
-PI_IP_ADDRESS = "192.168.1.16" 
-PORT_STREAM = 8000
-STREAM_URL = f"http://{PI_IP_ADDRESS}:{PORT_STREAM}/stream.mjpg" 
+PI_IP_ADDRESS = "172.20.10.4" # Ví dụ: Thay bằng IP thực tế của Pi
+VIDEO_PATH = "./10.mp4"
+OUTPUT_PATH = "./output_violation_final_fixed.mp4" 
 PORT_LCD = 65432
 VIOLATION_DIR = "Results_violation" 
 SUMMARY_OUTPUT_PATH = "./violation_summary.csv"
@@ -354,7 +354,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"❌ Lỗi kết nối MQTT: {e}")
         
-    process_camera_feed(STREAM_URL)
+    process_camera_feed(VIDEO_PATH)
     
     if client:
         client.loop_stop()
