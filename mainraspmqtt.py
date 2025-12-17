@@ -5,6 +5,7 @@ import json
 import os
 import csv
 import time
+import socket
 import paho.mqtt.client as mqtt # ⬅️ THÊM: Import MQTT
 # KHÔNG CẦN import threading, Picamera2, FrameBuffer trên PC
 
@@ -19,6 +20,8 @@ from lp_reader import read_license_plate_from_file
 PI_IP_ADDRESS = "192.168.1.16---------------------------------------------------------------------------------------------------------------------------------" # Ví dụ: Thay bằng IP thực tế của Pi
 PORT_STREAM = 8000
 STREAM_URL = f"http://{PI_IP_ADDRESS}:{PORT_STREAM}/stream.mjpg" 
+
+PORT_LCD = 65432
 
 VIOLATION_DIR = "Results_violation" 
 PLATE_EXPANSION_FACTOR = 0.7           
@@ -68,6 +71,19 @@ def send_violation(plate_text):
             print(f"🚀 Đã gửi lên ThingsBoard: {payload}")
         except Exception as e:
             print("❌ Lỗi khi gửi dữ liệu lên ThingsBoard:", e)
+
+# 2. ⬅️ THÊM: Gửi sang Raspberry Pi (LCD)
+def send_to_pi_lcd(plate_text):
+    """Gửi chuỗi biển số sang Raspberry Pi qua Socket LAN"""
+    try:
+        # Tạo kết nối socket ngắn hạn
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(2) # Timeout sau 2 giây nếu Pi không phản hồi
+            s.connect((PI_IP_ADDRESS, PORT_LCD))
+            s.sendall(plate_text.encode('utf-8'))
+            print(f"🖥️ [LCD] Đã gửi '{plate_text}' sang Pi để hiển thị.")
+    except Exception as e:
+        print(f"⚠️ Không thể gửi tin hiệu ra LCD (Kiểm tra file lcd_server.py trên Pi): {e}")
 
 # ============================ #
 # 📊 HÀM TÍNH IOU #
@@ -293,6 +309,8 @@ def process_camera_feed(stream_url):
 
                             # 🚀 GỬI DỮ LIỆU LÊN THINGSBOARD # ⬅️ THÊM: Gửi dữ liệu
                             send_violation(plate_final)
+                            # 🖥️ GỬI SANG PI LCD # ⬅️ THÊM: Gửi sang Pi LCD
+                            send_to_pi_lcd(plate_final)
                         
                         # -----------------------------------------------------
                         
@@ -367,4 +385,5 @@ if __name__ == "__main__":
     # Dừng vòng lặp MQTT khi kết thúc xử lý
     if client:
         client.loop_stop()
+
         print("💡 Đã ngắt kết nối MQTT.")
